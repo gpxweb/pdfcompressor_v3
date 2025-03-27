@@ -237,7 +237,7 @@ document.addEventListener('DOMContentLoaded', function() {
     // We've removed the compress button and its event listener
     // Compression now starts automatically after file upload
 
-    // Client-side PDF compression - safe version
+    // Client-side PDF compression - aggressive but reliable version
     async function compressPdf(pdfBytes) {
         try {
             logDebug('Starting PDF compression');
@@ -251,20 +251,57 @@ document.addEventListener('DOMContentLoaded', function() {
             
             try {
                 // First validate the PDF by loading it with PDF.js
-                // This will check if the PDF is valid before we try to compress it
                 logDebug('Validating PDF with PDF.js');
+                let pageCount = 0;
                 try {
                     const loadingTask = pdfjsLib.getDocument({ data: pdfBytes });
                     const pdfJsDoc = await loadingTask.promise;
-                    const pageCount = pdfJsDoc.numPages;
+                    pageCount = pdfJsDoc.numPages;
                     logDebug(`PDF validation successful: ${pageCount} pages`);
                 } catch (pdfJsError) {
                     logDebug(`PDF validation failed: ${pdfJsError.message}`);
                     throw new Error(`Invalid PDF: ${pdfJsError.message}`);
                 }
                 
+                // Try aggressive compression using page re-rendering approach first
+                // This is especially effective for image-heavy PDFs
+                try {
+                    statusText.textContent = 'Performing deep compression...';
+                    logDebug('Trying deep compression with re-rendering approach');
+                    
+                    const aggressiveCompressedBytes = await extractAndCompressImagesFromPDF(pdfBytes);
+                    
+                    // Validate the aggressively compressed PDF
+                    try {
+                        const checkTask = pdfjsLib.getDocument({ data: aggressiveCompressedBytes });
+                        const checkDoc = await checkTask.promise;
+                        
+                        // Check if we got a good compression ratio and the page count is correct
+                        if (checkDoc.numPages === pageCount && 
+                            aggressiveCompressedBytes.length < pdfBytes.length * 0.7) { // At least 30% reduction
+                            
+                            const originalSize = pdfBytes.length / 1024 / 1024;
+                            const compressedSize = aggressiveCompressedBytes.length / 1024 / 1024;
+                            const percentReduction = ((1 - (compressedSize / originalSize)) * 100).toFixed(2);
+                            
+                            logDebug(`Deep compression successful! Reduced by ${percentReduction}%`);
+                            logDebug(`Original: ${originalSize.toFixed(2)} MB, Compressed: ${compressedSize.toFixed(2)} MB`);
+                            
+                            return aggressiveCompressedBytes;
+                        } else {
+                            logDebug('Deep compression produced insufficient results, trying standard approach');
+                        }
+                    } catch (e) {
+                        logDebug(`Deep compression validation failed: ${e.message}, trying standard approach`);
+                    }
+                } catch (e) {
+                    logDebug(`Deep compression failed: ${e.message}, trying standard approach`);
+                }
+                
+                // If we got here, try the standard PDF-Lib approach
                 // Load the PDF document using pdf-lib for compression
-                logDebug('Loading PDF with pdf-lib');
+                statusText.textContent = 'Optimizing document structure...';
+                logDebug('Using standard PDF-lib compression');
                 const pdfDoc = await PDFLib.PDFDocument.load(pdfBytes, { 
                     ignoreEncryption: true,
                     updateMetadata: false
@@ -274,47 +311,66 @@ document.addEventListener('DOMContentLoaded', function() {
                 const pages = pdfDoc.getPages();
                 logDebug(`PDF has ${pages.length} pages`);
                 
-                statusText.textContent = `Optimizing ${pages.length} page(s)...`;
-                
-                // Apply conservative compression options - focus on reliability
-                logDebug('Applying safe compression settings');
+                // Apply more aggressive compression options
+                logDebug('Applying more aggressive compression settings');
                 const compressedPdfBytes = await pdfDoc.save({
                     useObjectStreams: true,
                     addDefaultPage: false,
                     updateMetadata: false,
+                    objectsPerTick: 20, // Process fewer objects per tick for more thorough compression
                 });
                 
-                // Check if compression was successful
+                // Check compression results
                 const originalSize = pdfBytes.length / 1024 / 1024;
                 const compressedSize = compressedPdfBytes.length / 1024 / 1024;
+                const percentReduction = ((1 - (compressedSize / originalSize)) * 100).toFixed(2);
+                
                 logDebug(`Original size: ${originalSize.toFixed(2)} MB`);
                 logDebug(`Compressed size: ${compressedSize.toFixed(2)} MB`);
+                logDebug(`Reduction: ${percentReduction}%`);
                 
-                // Safety check: Validate the compressed PDF
-                try {
-                    logDebug('Validating compressed PDF');
-                    const validationTask = pdfjsLib.getDocument({ data: compressedPdfBytes });
-                    const validatedDoc = await validationTask.promise;
+                // If compression didn't reduce size significantly, try the aggressive approach one more time
+                if (compressedPdfBytes.length > pdfBytes.length * 0.9) { // Less than 10% reduction
+                    logDebug('Standard compression insufficient, retrying deeper compression with lower quality');
                     
-                    if (validatedDoc.numPages !== pages.length) {
-                        logDebug('Page count mismatch in compressed PDF, using original');
-                        return pdfBytes;
+                    try {
+                        statusText.textContent = 'Applying maximum compression...';
+                        
+                        // Use image-based rendering with lower quality
+                        const finalBytes = await extractAndCompressImagesFromPDF(pdfBytes, 0.5, 0.6);
+                        
+                        // Quick validation
+                        try {
+                            const finalCheckTask = pdfjsLib.getDocument({ data: finalBytes });
+                            const finalCheckDoc = await finalCheckTask.promise;
+                            
+                            if (finalCheckDoc.numPages === pageCount && 
+                                finalBytes.length < pdfBytes.length * 0.8) { // At least 20% reduction
+                                
+                                const finalSize = finalBytes.length / 1024 / 1024;
+                                const finalReduction = ((1 - (finalSize / originalSize)) * 100).toFixed(2);
+                                
+                                logDebug(`Final compression successful! Reduced by ${finalReduction}%`);
+                                return finalBytes;
+                            }
+                        } catch (e) {
+                            logDebug(`Final compression validation failed: ${e.message}`);
+                        }
+                    } catch (e) {
+                        logDebug(`Final compression attempt failed: ${e.message}`);
                     }
-                    
-                    logDebug('Compressed PDF validation successful');
-                } catch (validationError) {
-                    logDebug(`Compressed PDF validation failed: ${validationError.message}`);
-                    return pdfBytes; // Return original if compressed version is invalid
                 }
                 
-                // If compression actually made the file bigger, return original
-                if (compressedPdfBytes.length >= pdfBytes.length) {
-                    logDebug('Compression did not reduce size, returning original');
-                    return pdfBytes;
+                // If we're here and the standard compression produced decent results, use it
+                if (compressedPdfBytes.length < pdfBytes.length * 0.9) { // At least 10% reduction
+                    logDebug('Using standard compression results');
+                    return compressedPdfBytes;
                 }
                 
-                logDebug('Compression successful');
-                return compressedPdfBytes;
+                // If all compression attempts did not significantly reduce size
+                logDebug('All compression methods failed to significantly reduce size');
+                return pdfBytes;
+                
             } catch (e) {
                 logDebug(`Error during compression: ${e.message}`);
                 // If any error occurs, return the original file
@@ -471,17 +527,25 @@ async function compressImage(imageData, quality = 0.7, maxWidth = 1200, maxHeigh
 }
 
 // Function to extract and compress images from a rendered PDF page
-async function extractAndCompressImagesFromPDF(pdfBytes) {
+// This is the most aggressive compression method that re-renders each page as a JPEG
+async function extractAndCompressImagesFromPDF(pdfBytes, imageScale = 0.6, imageQuality = 0.6) {
     try {
+        logDebug(`Starting deep compression with scale=${imageScale}, quality=${imageQuality}`);
+        
         // Load the PDF with PDF.js
         const loadingTask = pdfjsLib.getDocument({ data: pdfBytes });
         const pdfDoc = await loadingTask.promise;
+        const pageCount = pdfDoc.numPages;
+        
+        logDebug(`Loaded PDF with ${pageCount} pages for deep compression`);
         
         // Create a new PDF document using pdf-lib
         const newPdfDoc = await PDFLib.PDFDocument.create();
         
         // Process each page
-        for (let i = 0; i < pdfDoc.numPages; i++) {
+        for (let i = 0; i < pageCount; i++) {
+            statusText.textContent = `Compressing page ${i + 1} of ${pageCount}...`;
+            
             // Get the PDF page
             const page = await pdfDoc.getPage(i + 1);
             
@@ -489,10 +553,16 @@ async function extractAndCompressImagesFromPDF(pdfBytes) {
             const canvas = document.createElement('canvas');
             const context = canvas.getContext('2d');
             
-            // Get page viewport at a reduced scale (70% of original size)
-            const viewport = page.getViewport({ scale: 0.7 });
+            // Get page viewport at a reduced scale
+            // For massive PDFs, we need to dramatically reduce the image size
+            const originalViewport = page.getViewport({ scale: 1.0 });
+            const scale = determineOptimalScale(originalViewport.width, originalViewport.height, imageScale);
+            
+            const viewport = page.getViewport({ scale: scale });
             canvas.width = viewport.width;
             canvas.height = viewport.height;
+            
+            logDebug(`Rendering page ${i + 1} at scale ${scale} (${canvas.width}x${canvas.height})`);
             
             // Render the page to canvas with lowered quality
             await page.render({
@@ -500,34 +570,72 @@ async function extractAndCompressImagesFromPDF(pdfBytes) {
                 viewport: viewport
             }).promise;
             
-            // Get canvas data as JPEG with 80% quality
-            const pageImageData = canvas.toDataURL('image/jpeg', 0.8);
+            // Get canvas data as JPEG with reduced quality
+            // Lower quality = smaller file size
+            const pageImageData = canvas.toDataURL('image/jpeg', imageQuality);
             
-            // Create a new page in the output PDF
-            const newPage = newPdfDoc.addPage([viewport.width, viewport.height]);
+            // Create a new page in the output PDF with original dimensions
+            // We use the original page dimensions to ensure proper display
+            const newPage = newPdfDoc.addPage([originalViewport.width, originalViewport.height]);
             
-            // Convert the base64 image to a format usable by pdf-lib
-            const jpgImageBytes = await fetch(pageImageData).then(res => res.arrayBuffer());
-            const jpgImage = await newPdfDoc.embedJpg(jpgImageBytes);
-            
-            // Draw the compressed image on the page
-            newPage.drawImage(jpgImage, {
-                x: 0,
-                y: 0,
-                width: viewport.width,
-                height: viewport.height
-            });
+            try {
+                // Convert the base64 image to a format usable by pdf-lib
+                const jpgImageBytes = await fetch(pageImageData).then(res => res.arrayBuffer());
+                const jpgImage = await newPdfDoc.embedJpg(jpgImageBytes);
+                
+                // Draw the compressed image on the page, stretching to fill the entire page
+                newPage.drawImage(jpgImage, {
+                    x: 0,
+                    y: 0,
+                    width: originalViewport.width,
+                    height: originalViewport.height
+                });
+                
+                logDebug(`Page ${i + 1} processed successfully`);
+            } catch (pageError) {
+                logDebug(`Error processing page ${i + 1}: ${pageError.message}`);
+                // Continue with other pages even if one fails
+            }
         }
         
-        // Save the output PDF
+        // Save the output PDF with maximum compression
+        logDebug('Saving compressed PDF with aggressive settings');
         const compressedPdfBytes = await newPdfDoc.save({
             useObjectStreams: true,
-            addDefaultPage: false
+            addDefaultPage: false,
+            objectsPerTick: 10
         });
+        
+        const originalSize = pdfBytes.length / 1024 / 1024;
+        const compressedSize = compressedPdfBytes.length / 1024 / 1024;
+        const percentReduction = ((1 - (compressedSize / originalSize)) * 100).toFixed(2);
+        
+        logDebug(`Deep compression complete. Original: ${originalSize.toFixed(2)}MB, Compressed: ${compressedSize.toFixed(2)}MB, Reduction: ${percentReduction}%`);
         
         return compressedPdfBytes;
     } catch (error) {
         console.error('Error in extract and compress:', error);
+        logDebug(`Deep compression failed: ${error.message}`);
         throw error;
+    }
+}
+
+// Helper function to determine optimal scale based on page dimensions
+function determineOptimalScale(width, height, baseScale = 0.6) {
+    // For very large pages, use a more aggressive scale reduction
+    const maxDimension = Math.max(width, height);
+    
+    if (maxDimension > 5000) {
+        // Extremely large page
+        return baseScale * 0.5; // 30% of original
+    } else if (maxDimension > 3000) {
+        // Very large page
+        return baseScale * 0.7; // 42% of original
+    } else if (maxDimension > 2000) {
+        // Large page
+        return baseScale * 0.8; // 48% of original
+    } else {
+        // Standard page
+        return baseScale; // 60% of original by default
     }
 }
