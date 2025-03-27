@@ -237,16 +237,38 @@ document.addEventListener('DOMContentLoaded', function() {
     // We've removed the compress button and its event listener
     // Compression now starts automatically after file upload
 
-    // Client-side PDF compression - simplified version
+    // Client-side PDF compression - safe version
     async function compressPdf(pdfBytes) {
         try {
             logDebug('Starting PDF compression');
             statusText.textContent = 'Compressing PDF...';
             
+            // Validate input
+            if (!pdfBytes || pdfBytes.length === 0) {
+                logDebug('Invalid PDF bytes');
+                throw new Error('Invalid PDF data');
+            }
+            
             try {
-                // Load the PDF document using pdf-lib
-                logDebug('Loading PDF document');
-                const pdfDoc = await PDFLib.PDFDocument.load(pdfBytes, { ignoreEncryption: true });
+                // First validate the PDF by loading it with PDF.js
+                // This will check if the PDF is valid before we try to compress it
+                logDebug('Validating PDF with PDF.js');
+                try {
+                    const loadingTask = pdfjsLib.getDocument({ data: pdfBytes });
+                    const pdfJsDoc = await loadingTask.promise;
+                    const pageCount = pdfJsDoc.numPages;
+                    logDebug(`PDF validation successful: ${pageCount} pages`);
+                } catch (pdfJsError) {
+                    logDebug(`PDF validation failed: ${pdfJsError.message}`);
+                    throw new Error(`Invalid PDF: ${pdfJsError.message}`);
+                }
+                
+                // Load the PDF document using pdf-lib for compression
+                logDebug('Loading PDF with pdf-lib');
+                const pdfDoc = await PDFLib.PDFDocument.load(pdfBytes, { 
+                    ignoreEncryption: true,
+                    updateMetadata: false
+                });
                 
                 // Get all pages
                 const pages = pdfDoc.getPages();
@@ -254,11 +276,12 @@ document.addEventListener('DOMContentLoaded', function() {
                 
                 statusText.textContent = `Optimizing ${pages.length} page(s)...`;
                 
-                // Apply basic compression options
-                logDebug('Applying compression settings');
+                // Apply conservative compression options - focus on reliability
+                logDebug('Applying safe compression settings');
                 const compressedPdfBytes = await pdfDoc.save({
                     useObjectStreams: true,
                     addDefaultPage: false,
+                    updateMetadata: false,
                 });
                 
                 // Check if compression was successful
@@ -266,6 +289,23 @@ document.addEventListener('DOMContentLoaded', function() {
                 const compressedSize = compressedPdfBytes.length / 1024 / 1024;
                 logDebug(`Original size: ${originalSize.toFixed(2)} MB`);
                 logDebug(`Compressed size: ${compressedSize.toFixed(2)} MB`);
+                
+                // Safety check: Validate the compressed PDF
+                try {
+                    logDebug('Validating compressed PDF');
+                    const validationTask = pdfjsLib.getDocument({ data: compressedPdfBytes });
+                    const validatedDoc = await validationTask.promise;
+                    
+                    if (validatedDoc.numPages !== pages.length) {
+                        logDebug('Page count mismatch in compressed PDF, using original');
+                        return pdfBytes;
+                    }
+                    
+                    logDebug('Compressed PDF validation successful');
+                } catch (validationError) {
+                    logDebug(`Compressed PDF validation failed: ${validationError.message}`);
+                    return pdfBytes; // Return original if compressed version is invalid
+                }
                 
                 // If compression actually made the file bigger, return original
                 if (compressedPdfBytes.length >= pdfBytes.length) {
@@ -289,24 +329,49 @@ document.addEventListener('DOMContentLoaded', function() {
 
     // Download the compressed file
     downloadBtn.addEventListener('click', function() {
-        if (!compressedPdfBytes) return;
-        
-        // Create blob from array buffer
-        const blob = new Blob([compressedPdfBytes], { type: 'application/pdf' });
-        
-        // Create download URL
-        const url = URL.createObjectURL(blob);
-        
-        // Create a temporary link and trigger download
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = currentFileName.replace('.pdf', '_compressed.pdf');
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        
-        // Clean up
-        URL.revokeObjectURL(url);
+        if (!compressedPdfBytes) {
+            showError("No compressed file available for download");
+            return;
+        }
+
+        try {
+            logDebug("Creating download for file: " + currentFileName);
+            
+            // Make sure we're working with a valid Uint8Array
+            const pdfBytes = new Uint8Array(compressedPdfBytes);
+            logDebug("PDF bytes length: " + pdfBytes.length);
+            
+            // Create blob with proper MIME type
+            const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+            logDebug("Created blob of size: " + blob.size);
+            
+            // Create download URL
+            const url = URL.createObjectURL(blob);
+            logDebug("Created object URL: " + url);
+            
+            // Use a more reliable download approach
+            const filename = currentFileName.replace('.pdf', '_compressed.pdf');
+            logDebug("Download filename: " + filename);
+            
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = filename;
+            link.target = '_blank'; // Open in new tab if download doesn't start
+            
+            // Add to DOM, click, and remove
+            document.body.appendChild(link);
+            link.click();
+            
+            // Small delay before cleanup
+            setTimeout(() => {
+                document.body.removeChild(link);
+                URL.revokeObjectURL(url);
+                logDebug("Download cleanup complete");
+            }, 100);
+        } catch (error) {
+            console.error("Download error:", error);
+            showError("Failed to download: " + error.message);
+        }
     });
 
     // Handle new file button
